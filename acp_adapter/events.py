@@ -25,7 +25,7 @@ logger = logging.getLogger(__name__)
 
 
 def _send_update(
-    conn: acp.Client,
+    conn: Any,
     session_id: str,
     loop: asyncio.AbstractEventLoop,
     update: Any,
@@ -45,7 +45,7 @@ def _send_update(
 # ------------------------------------------------------------------
 
 def make_tool_progress_cb(
-    conn: acp.Client,
+    conn: Any,
     session_id: str,
     loop: asyncio.AbstractEventLoop,
     tool_call_ids: Dict[str, Deque[str]],
@@ -106,7 +106,7 @@ def make_tool_progress_cb(
 # ------------------------------------------------------------------
 
 def make_thinking_cb(
-    conn: acp.Client,
+    conn: Any,
     session_id: str,
     loop: asyncio.AbstractEventLoop,
 ) -> Callable:
@@ -126,7 +126,7 @@ def make_thinking_cb(
 # ------------------------------------------------------------------
 
 def make_step_cb(
-    conn: acp.Client,
+    conn: Any,
     session_id: str,
     loop: asyncio.AbstractEventLoop,
     tool_call_ids: Dict[str, Deque[str]],
@@ -179,7 +179,7 @@ def make_step_cb(
 # ------------------------------------------------------------------
 
 def make_message_cb(
-    conn: acp.Client,
+    conn: Any,
     session_id: str,
     loop: asyncio.AbstractEventLoop,
 ) -> Callable:

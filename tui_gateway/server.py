@@ -116,7 +116,7 @@ from tui_gateway.render import make_stream_renderer, render_diff, render_message
 
 _sessions: dict[str, dict] = {}
 _methods: dict[str, callable] = {}
-_pending: dict[str, tuple[str, threading.Event]] = {}
+_pending: dict[str, threading.Event] = {}
 _answers: dict[str, str] = {}
 _db = None
 _db_error: str | None = None
@@ -128,6 +128,8 @@ _cfg_path = None
 _SLASH_WORKER_TIMEOUT_S = max(
     5.0, float(os.environ.get("HERMES_TUI_SLASH_TIMEOUT_S", "45") or 45)
 )
+
+import concurrent.futures
 
 # ── Async RPC dispatch (#12546) ──────────────────────────────────────
 # A handful of handlers block the dispatcher loop in entry.py for seconds
@@ -154,7 +156,6 @@ _pool = concurrent.futures.ThreadPoolExecutor(
     thread_name_prefix="tui-rpc",
 )
 atexit.register(lambda: _pool.shutdown(wait=False, cancel_futures=True))
-
 # Reserve real stdout for JSON-RPC only; redirect Python's stdout to stderr
 # so stray print() from libraries/tools becomes harmless gateway.stderr instead
 # of corrupting the JSON protocol.
@@ -565,7 +566,7 @@ def _enable_gateway_prompts() -> None:
 def _block(event: str, sid: str, payload: dict, timeout: int = 300) -> str:
     rid = uuid.uuid4().hex[:8]
     ev = threading.Event()
-    _pending[rid] = (sid, ev)
+    _pending[rid] = ev
     payload["request_id"] = rid
     _emit(event, sid, payload)
     ev.wait(timeout=timeout)
@@ -573,19 +574,10 @@ def _block(event: str, sid: str, payload: dict, timeout: int = 300) -> str:
     return _answers.pop(rid, "")
 
 
-def _clear_pending(sid: str | None = None) -> None:
-    """Release pending prompts with an empty answer.
-
-    When *sid* is provided, only prompts owned by that session are
-    released — critical for session.interrupt, which must not
-    collaterally cancel clarify/sudo/secret prompts on unrelated
-    sessions sharing the same tui_gateway process.  When *sid* is
-    None, every pending prompt is released (used during shutdown).
-    """
-    for rid, (owner_sid, ev) in list(_pending.items()):
-        if sid is None or owner_sid == sid:
-            _answers[rid] = ""
-            ev.set()
+def _clear_pending():
+    for rid, ev in list(_pending.items()):
+        _answers[rid] = ""
+        ev.set()
 
 
 # ── Agent factory ────────────────────────────────────────────────────
@@ -1605,23 +1597,7 @@ def _(rid, params: dict) -> dict:
     }
 
     def _build() -> None:
-        session = _sessions.get(sid)
-        if session is None:
-            # session.close ran before the build thread got scheduled.
-            ready.set()
-            return
-
-        # Track what we allocate so we can clean up if session.close
-        # races us to the finish line.  session.close pops _sessions[sid]
-        # unconditionally and tries to close the slash_worker it finds;
-        # if _build is still mid-construction when close runs, close
-        # finds slash_worker=None / notify unregistered and returns
-        # cleanly — leaving us, the build thread, to later install the
-        # worker + notify on an orphaned session dict.  The finally
-        # block below detects the orphan and cleans up instead of
-        # leaking a subprocess and a global notify registration.
-        worker = None
-        notify_registered = False
+        session = _sessions[sid]
         try:
             tokens = _set_session_context(key)
             try:
@@ -1671,12 +1647,13 @@ def _(rid, params: dict) -> dict:
             session["agent"] = agent
 
             try:
-                worker = _SlashWorker(key, getattr(agent, "model", _resolve_model()))
-                session["slash_worker"] = worker
+                session["slash_worker"] = _SlashWorker(key, getattr(agent, "model", _resolve_model()))
             except Exception:
                 pass
 
             try:
+                from tools.approval import register_gateway_notify, load_permanent_allowlist
+                register_gateway_notify(key, lambda data: _emit("approval.request", sid, data))
                 from tools.approval import (
                     register_gateway_notify,
                     load_permanent_allowlist,
@@ -2090,11 +2067,7 @@ def _(rid, params: dict) -> dict:
         return err
     if hasattr(session["agent"], "interrupt"):
         session["agent"].interrupt()
-    # Scope the pending-prompt release to THIS session.  A global
-    # _clear_pending() would collaterally cancel clarify/sudo/secret
-    # prompts on unrelated sessions sharing the same tui_gateway
-    # process, silently resolving them to empty strings.
-    _clear_pending(params.get("session_id", ""))
+    _clear_pending()
     try:
         from tools.approval import resolve_gateway_approval
 
@@ -2495,33 +2468,12 @@ def _(rid, params: dict) -> dict:
             )
 
             last_reasoning = None
-            status_note = None
             if isinstance(result, dict):
                 if isinstance(result.get("messages"), list):
                     with session["history_lock"]:
-                        current_version = int(session.get("history_version", 0))
-                        if current_version == history_version:
+                        if int(session.get("history_version", 0)) == history_version:
                             session["history"] = result["messages"]
                             session["history_version"] = history_version + 1
-                        else:
-                            # History mutated externally during the turn
-                            # (undo/compress/retry/rollback now guard on
-                            # session.running, but this is the defensive
-                            # backstop for any path that slips past).
-                            # Surface the desync rather than silently
-                            # dropping the agent's output — the UI can
-                            # show the response and warn that it was
-                            # not persisted.
-                            print(
-                                f"[tui_gateway] prompt.submit: history_version mismatch "
-                                f"(expected={history_version} current={current_version}) — "
-                                f"agent output NOT written to session history",
-                                file=sys.stderr,
-                            )
-                            status_note = (
-                                "History changed during this turn — the response above is visible "
-                                "but was not saved to session history."
-                            )
                 raw = result.get("final_response", "")
                 status = (
                     "interrupted"
@@ -2538,8 +2490,6 @@ def _(rid, params: dict) -> dict:
             payload = {"text": raw, "usage": _get_usage(agent), "status": status}
             if last_reasoning:
                 payload["reasoning"] = last_reasoning
-            if status_note:
-                payload["warning"] = status_note
             rendered = render_message(raw, cols)
             if rendered:
                 payload["rendered"] = rendered
@@ -2624,6 +2574,7 @@ def _(rid, params: dict) -> dict:
     if err:
         return err
     try:
+        from datetime import datetime
         from hermes_cli.clipboard import has_clipboard_image, save_clipboard_image
     except Exception as e:
         return _err(rid, 5027, f"clipboard unavailable: {e}")
@@ -2667,6 +2618,7 @@ def _(rid, params: dict) -> dict:
     if not raw:
         return _err(rid, 4015, "path required")
     try:
+        from cli import _IMAGE_EXTENSIONS, _resolve_attachment_path, _split_path_input
         from cli import (
             _IMAGE_EXTENSIONS,
             _detect_file_drop,
@@ -2674,15 +2626,10 @@ def _(rid, params: dict) -> dict:
             _split_path_input,
         )
 
-        dropped = _detect_file_drop(raw)
-        if dropped:
-            image_path = dropped["path"]
-            remainder = dropped["remainder"]
-        else:
-            path_token, remainder = _split_path_input(raw)
-            image_path = _resolve_attachment_path(path_token)
-            if image_path is None:
-                return _err(rid, 4016, f"image not found: {path_token}")
+        path_token, remainder = _split_path_input(raw)
+        image_path = _resolve_attachment_path(path_token)
+        if image_path is None:
+            return _err(rid, 4016, f"image not found: {path_token}")
         if image_path.suffix.lower() not in _IMAGE_EXTENSIONS:
             return _err(rid, 4016, f"unsupported image: {image_path.name}")
         session.setdefault("attached_images", []).append(str(image_path))
@@ -2799,10 +2746,9 @@ def _(rid, params: dict) -> dict:
 
 def _respond(rid, params, key):
     r = params.get("request_id", "")
-    entry = _pending.get(r)
-    if not entry:
+    ev = _pending.get(r)
+    if not ev:
         return _err(rid, 4009, f"no pending {key} request")
-    _, ev = entry
     _answers[r] = params.get(key, "")
     ev.set()
     return _ok(rid, {"status": "ok"})
@@ -2858,6 +2804,7 @@ def _(rid, params: dict) -> dict:
             if not value:
                 return _err(rid, 4002, "model value required")
             if session:
+                result = _apply_model_switch(params.get("session_id", ""), session, value)
                 # Reject during an in-flight turn.  agent.switch_model()
                 # mutates self.model / self.provider / self.base_url /
                 # self.client in place; the worker thread running
@@ -4162,18 +4109,13 @@ def _(rid, params: dict) -> dict:
 def _(rid, params: dict) -> dict:
     try:
         from hermes_cli.model_switch import list_authenticated_providers
+        from hermes_cli.models import provider_model_ids
 
         session = _sessions.get(params.get("session_id", ""))
         agent = session.get("agent") if session else None
         cfg = _load_cfg()
         current_provider = getattr(agent, "provider", "") or ""
         current_model = getattr(agent, "model", "") or _resolve_model()
-        # list_authenticated_providers already populates each provider's
-        # "models" with the curated list (same source as `hermes model` and
-        # classic CLI's /model picker). Do NOT overwrite with live
-        # provider_model_ids() — that bypasses curation and pulls in
-        # non-agentic models (e.g. Nous /models returns ~400 IDs including
-        # TTS, embeddings, rerankers, image/video generators).
         providers = list_authenticated_providers(
             current_provider=current_provider,
             user_providers=(
@@ -4186,6 +4128,15 @@ def _(rid, params: dict) -> dict:
             ),
             max_models=50,
         )
+        for provider in providers:
+            try:
+                models = provider_model_ids(provider.get("slug"))
+                if models:
+                    provider["models"] = models
+                    provider["total_models"] = len(models)
+            except Exception as e:
+                provider["warning"] = f"model catalog unavailable: {e}"
+        return _ok(rid, {"providers": providers, "model": current_model, "provider": current_provider})
         return _ok(
             rid,
             {
@@ -4497,6 +4448,7 @@ def _(rid, params: dict) -> dict:
     if db is None:
         return _db_unavailable_error(rid, code=5017)
     try:
+        import time
         cutoff = time.time() - days * 86400
         rows = [
             s

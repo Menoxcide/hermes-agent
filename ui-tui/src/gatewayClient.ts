@@ -5,17 +5,11 @@ import { delimiter, resolve } from 'node:path'
 import { createInterface } from 'node:readline'
 
 import type { GatewayEvent } from './gatewayTypes.js'
-import { CircularBuffer } from './lib/circularBuffer.js'
 
 const MAX_GATEWAY_LOG_LINES = 200
-const MAX_LOG_LINE_BYTES = 4096
-const MAX_BUFFERED_EVENTS = 2000
 const MAX_LOG_PREVIEW = 240
 const STARTUP_TIMEOUT_MS = Math.max(5000, parseInt(process.env.HERMES_TUI_STARTUP_TIMEOUT_MS ?? '15000', 10) || 15000)
 const REQUEST_TIMEOUT_MS = Math.max(30000, parseInt(process.env.HERMES_TUI_RPC_TIMEOUT_MS ?? '120000', 10) || 120000)
-
-const truncateLine = (line: string) =>
-  line.length > MAX_LOG_LINE_BYTES ? `${line.slice(0, MAX_LOG_LINE_BYTES)}… [truncated ${line.length} bytes]` : line
 
 const resolvePython = (root: string) => {
   const configured = process.env.HERMES_PYTHON?.trim() || process.env.PYTHON?.trim()
@@ -44,32 +38,22 @@ const asGatewayEvent = (value: unknown): GatewayEvent | null =>
     : null
 
 interface Pending {
-  id: string
-  method: string
   reject: (e: Error) => void
   resolve: (v: unknown) => void
-  timeout: ReturnType<typeof setTimeout>
 }
 
 export class GatewayClient extends EventEmitter {
   private proc: ChildProcess | null = null
   private reqId = 0
-  private logs = new CircularBuffer<string>(MAX_GATEWAY_LOG_LINES)
+  private logs: string[] = []
   private pending = new Map<string, Pending>()
-  private bufferedEvents = new CircularBuffer<GatewayEvent>(MAX_BUFFERED_EVENTS)
+  private bufferedEvents: GatewayEvent[] = []
   private pendingExit: number | null | undefined
   private ready = false
   private readyTimer: ReturnType<typeof setTimeout> | null = null
   private subscribed = false
   private stdoutRl: ReturnType<typeof createInterface> | null = null
   private stderrRl: ReturnType<typeof createInterface> | null = null
-
-  constructor() {
-    super()
-    // useInput / createGatewayEventHandler can legitimately attach many
-    // listeners. Default 10-cap triggers spurious warnings.
-    this.setMaxListeners(0)
-  }
 
   private publish(ev: GatewayEvent) {
     if (ev.type === 'gateway.ready') {
@@ -97,7 +81,7 @@ export class GatewayClient extends EventEmitter {
     env.PYTHONPATH = pyPath ? `${root}${delimiter}${pyPath}` : root
 
     this.ready = false
-    this.bufferedEvents.clear()
+    this.bufferedEvents = []
     this.pendingExit = undefined
     this.stdoutRl?.close()
     this.stderrRl?.close()
@@ -137,7 +121,7 @@ export class GatewayClient extends EventEmitter {
 
     this.stderrRl = createInterface({ input: this.proc.stderr! })
     this.stderrRl.on('line', raw => {
-      const line = truncateLine(raw.trim())
+      const line = raw.trim()
 
       if (!line) {
         return
@@ -174,7 +158,15 @@ export class GatewayClient extends EventEmitter {
     const p = id ? this.pending.get(id) : undefined
 
     if (p) {
-      this.settle(p, msg.error ? this.toError(msg.error) : null, msg.result)
+      this.pending.delete(id!)
+
+      if (msg.error) {
+        const err = msg.error as { message?: unknown } | null | undefined
+
+        p.reject(new Error(typeof err?.message === 'string' ? err.message : 'request failed'))
+      } else {
+        p.resolve(msg.result)
+      }
 
       return
     }
@@ -188,51 +180,24 @@ export class GatewayClient extends EventEmitter {
     }
   }
 
-  private toError(raw: unknown): Error {
-    const err = raw as { message?: unknown } | null | undefined
-
-    return new Error(typeof err?.message === 'string' ? err.message : 'request failed')
-  }
-
-  private settle(p: Pending, err: Error | null, result: unknown) {
-    clearTimeout(p.timeout)
-    this.pending.delete(p.id)
-
-    if (err) {
-      p.reject(err)
-    } else {
-      p.resolve(result)
-    }
-  }
-
   private pushLog(line: string) {
-    this.logs.push(truncateLine(line))
+    if (this.logs.push(line) > MAX_GATEWAY_LOG_LINES) {
+      this.logs.splice(0, this.logs.length - MAX_GATEWAY_LOG_LINES)
+    }
   }
 
   private rejectPending(err: Error) {
     for (const p of this.pending.values()) {
-      clearTimeout(p.timeout)
       p.reject(err)
     }
 
     this.pending.clear()
   }
 
-  // Arrow class-field — stable identity, so `setTimeout(this.onTimeout, …, id)`
-  // doesn't allocate a bound function per request.
-  private onTimeout = (id: string) => {
-    const p = this.pending.get(id)
-
-    if (p) {
-      this.pending.delete(id)
-      p.reject(new Error(`timeout: ${p.method}`))
-    }
-  }
-
   drain() {
     this.subscribed = true
 
-    for (const ev of this.bufferedEvents.drain()) {
+    for (const ev of this.bufferedEvents.splice(0)) {
       this.emit('event', ev)
     }
 
@@ -245,7 +210,7 @@ export class GatewayClient extends EventEmitter {
   }
 
   getLogTail(limit = 20): string {
-    return this.logs.tail(Math.max(1, limit)).join('\n')
+    return this.logs.slice(-Math.max(1, limit)).join('\n')
   }
 
   request<T = unknown>(method: string, params: Record<string, unknown> = {}): Promise<T> {
@@ -259,29 +224,29 @@ export class GatewayClient extends EventEmitter {
 
     const id = `r${++this.reqId}`
 
-    return new Promise<T>((resolve, reject) => {
-      const timeout = setTimeout(this.onTimeout, REQUEST_TIMEOUT_MS, id)
-
-      timeout.unref?.()
+    return new Promise((resolve, reject) => {
+      const timeout = setTimeout(() => {
+        if (this.pending.delete(id)) {
+          reject(new Error(`timeout: ${method}`))
+        }
+      }, REQUEST_TIMEOUT_MS)
 
       this.pending.set(id, {
-        id,
-        method,
-        reject,
-        resolve: v => resolve(v as T),
-        timeout
+        reject: e => {
+          clearTimeout(timeout)
+          reject(e)
+        },
+        resolve: v => {
+          clearTimeout(timeout)
+          resolve(v as T)
+        }
       })
 
       try {
-        this.proc!.stdin!.write(JSON.stringify({ id, jsonrpc: '2.0', method, params }) + '\n')
+        this.proc!.stdin!.write(JSON.stringify({ jsonrpc: '2.0', id, method, params }) + '\n')
       } catch (e) {
-        const pending = this.pending.get(id)
-
-        if (pending) {
-          clearTimeout(pending.timeout)
-          this.pending.delete(id)
-        }
-
+        clearTimeout(timeout)
+        this.pending.delete(id)
         reject(e instanceof Error ? e : new Error(String(e)))
       }
     })

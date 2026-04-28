@@ -190,7 +190,7 @@ def _validate_cron_script_path(script: Optional[str]) -> Optional[str]:
 
 
 def _format_job(job: Dict[str, Any]) -> Dict[str, Any]:
-    prompt = job.get("prompt", "")
+    prompt = job.get("prompt") or ""
     skills = _canonical_skills(job.get("skill"), job.get("skills"))
     result = {
         "job_id": job["id"],

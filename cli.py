@@ -5594,6 +5594,47 @@ class HermesCLI:
         except Exception:
             return False
 
+    def _handle_providers_command(self, cmd_original: str):
+        """Handle /providers command — list all providers and their models.
+
+        Supports:
+        /providers — show all providers and available models
+        /providers --provider <name> — filter by provider
+        /providers --free-only — show only free tier models
+        """
+        from hermes_cli.list_providers import list_providers_main
+        import argparse
+
+        # Parse args from the original command
+        parts = cmd_original.split(None, 1) # split off '/providers'
+        raw_args = parts[1].strip() if len(parts) > 1 else ""
+
+        # Create a namespace object with parsed args
+        class Args:
+            provider = None
+            free_only = False
+            config = None
+
+        # Simple arg parsing
+        if '--provider' in raw_args:
+            idx = raw_args.index('--provider')
+            provider_val = raw_args[idx + len('--provider'):].strip().split()[0]
+            Args.provider = provider_val
+        if '--free-only' in raw_args or '-f' in raw_args:
+            Args.free_only = True
+        if '--config' in raw_args:
+            idx = raw_args.index('--config')
+            config_val = raw_args[idx + len('--config'):].strip().split()[0]
+            Args.config = config_val
+
+        args = Args()
+
+        # Run the providers command
+        try:
+            list_providers_main(args)
+        except Exception as e:
+            self._console_print(f"❌ Error listing providers: {e}")
+
     def _should_handle_steer_command_inline(self, text: str, has_images: bool = False) -> bool:
         """Return True when /steer should be dispatched immediately while the agent is running.
 
@@ -6200,6 +6241,10 @@ class HermesCLI:
             self._handle_resume_command(cmd_original)
         elif canonical == "model":
             self._handle_model_switch(cmd_original)
+        elif canonical == "providers":
+            self._handle_providers_command(cmd_original)
+        elif canonical == "provider":
+            self._show_model_and_providers()
         elif canonical == "gquota":
             self._handle_gquota_command(cmd_original)
 

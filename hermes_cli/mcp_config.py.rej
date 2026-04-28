@@ -1,0 +1,11 @@
+--- hermes_cli/mcp_config.py
++++ hermes_cli/mcp_config.py
+@@ -743,7 +743,7 @@ def mcp_command(args):
+ 
+     if action == "serve":
+         from mcp_serve import run_mcp_server
+-        run_mcp_server(verbose=getattr(args, "verbose", False))
++        run_mcp_server(verbose=getattr(args, "verbose", False), port=getattr(args, "port", None))
+         return
+ 
+     handlers = {

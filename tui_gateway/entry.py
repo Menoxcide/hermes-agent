@@ -5,6 +5,7 @@ import sys
 import time
 import traceback
 
+from tui_gateway.server import handle_request, resolve_skin, write_json
 from tui_gateway import server
 from tui_gateway.server import _CRASH_LOG, dispatch, resolve_skin, write_json
 from tui_gateway.transport import TeeTransport
@@ -137,6 +138,7 @@ def main():
                 sys.exit(0)
             continue
 
+        resp = handle_request(req)
         method = req.get("method") if isinstance(req, dict) else None
         resp = dispatch(req)
         if resp is not None:

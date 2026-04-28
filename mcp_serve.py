@@ -436,8 +436,14 @@ def create_mcp_server(event_bridge: Optional[EventBridge] = None) -> "FastMCP":
             f"Install with: {sys.executable} -m pip install 'mcp'"
         )
 
+    from mcp.server.transport_security import TransportSecuritySettings
+    import os
+    allow_remote = os.environ.get("HERMES_ALLOW_REMOTE_MCP", "").lower() in ("true", "1", "yes")
+    transport_sec = TransportSecuritySettings(enable_dns_rebinding_protection=False) if allow_remote else None
+
     mcp = FastMCP(
         "hermes",
+        transport_security=transport_sec,
         instructions=(
             "Hermes Agent messaging bridge. Use these tools to interact with "
             "conversations across Telegram, Discord, Slack, WhatsApp, Signal, "
@@ -826,6 +832,75 @@ def create_mcp_server(event_bridge: Optional[EventBridge] = None) -> "FastMCP":
         result = bridge.respond_to_approval(id, decision)
         return json.dumps(result, indent=2)
 
+    # -- node_health -------------------------------------------------------
+    
+    @mcp.tool()
+    def node_health() -> str:
+        """Get system health metrics (CPU, RAM, Disk, GPU)."""
+        import psutil, shutil, subprocess
+        disk = shutil.disk_usage("/")
+        data = {
+            "cpu_percent": psutil.cpu_percent(),
+            "ram_gb_available": round(psutil.virtual_memory().available / (1024**3), 2),
+            "disk_free_gb": round(disk.free / (1024**3), 2),
+            "gpu": "N/A"
+        }
+        try:
+            res = subprocess.run(["nvidia-smi", "--query-gpu=name,memory.free,temperature.gpu", "--format=csv,noheader,nounits"], capture_output=True, text=True)
+            if res.returncode == 0:
+                parts = [p.strip() for p in res.stdout.split(",")]
+                if len(parts) >= 3:
+                    data["gpu"] = {"name": parts[0], "free_mb": parts[1], "temp_c": parts[2]}
+        except Exception: pass
+        return json.dumps(data, indent=2)
+
+    # -- model_remote_control ----------------------------------------------
+
+    @mcp.tool()
+    def model_remote_control(action: str = "status") -> str:
+        """Control or check the local llama-server.
+        
+        Args:
+            action: 'status', 'start', 'stop', or 'restart'
+        """
+        import subprocess
+        if action == "status":
+            res = subprocess.run(["pgrep", "-f", "llama-server"], capture_output=True)
+            return "llama-server is " + ("UP (PID {})".format(res.stdout.decode().strip()) if res.returncode == 0 else "DOWN")
+        return f"Action '{action}' requested. (Note: Only status is fully automated in this bridge version)."
+
+    # -- system_status -----------------------------------------------------
+
+    @mcp.tool()
+    def system_status() -> str:
+        """Get status of critical Hermes background services."""
+        import subprocess
+        services = ["hermes-gateway", "redis-server", "syncthing"]
+        status = {}
+        for s in services:
+            try:
+                res = subprocess.run(["systemctl", "--user", "is-active", s], capture_output=True, text=True)
+                status[s] = res.stdout.strip()
+            except Exception:
+                status[s] = "unknown"
+        return json.dumps(status, indent=2)
+
+    # -- agent_list --------------------------------------------------------
+
+    @mcp.tool()
+    def agent_list() -> str:
+        """List active agent profiles and their identities."""
+        profiles_dir = Path.home() / ".hermes" / "profiles"
+        if not profiles_dir.exists():
+            return json.dumps({"profiles": [], "count": 0})
+        
+        profiles = []
+        for p in profiles_dir.iterdir():
+            if p.is_dir() and not p.name.startswith("."):
+                profiles.append({"name": p.name})
+                
+        return json.dumps({"profiles": profiles, "count": len(profiles)}, indent=2)
+
     return mcp
 
 
@@ -833,8 +908,8 @@ def create_mcp_server(event_bridge: Optional[EventBridge] = None) -> "FastMCP":
 # Entry point
 # ---------------------------------------------------------------------------
 
-def run_mcp_server(verbose: bool = False) -> None:
-    """Start the Hermes MCP server on stdio."""
+def run_mcp_server(verbose: bool = False, port: Optional[int] = None, **kwargs) -> None:
+    """Start the Hermes MCP server on stdio or HTTP/SSE."""
     if not _MCP_SERVER_AVAILABLE:
         print(
             "Error: MCP server requires the 'mcp' package.\n"
@@ -857,7 +932,187 @@ def run_mcp_server(verbose: bool = False) -> None:
 
     async def _run():
         try:
-            await server.run_stdio_async()
+            if port is not None:
+                server.settings.host = kwargs.get("host", "0.0.0.0")
+                server.settings.port = port
+                
+                # To handle clients that aggressively cache or hardcode POST /sse
+                # we add a middleware to rewrite POST /sse to POST /messages/
+                app = server.sse_app()
+                
+                async def asgi_rewrite(scope, receive, send):
+                    if scope["type"] == "http":
+                        path = scope["path"].rstrip("/")
+                        if path in ("/sse", "/events"):
+                            if path == "/events":
+                                scope = dict(scope)
+                                scope["path"] = "/sse"
+                                scope["raw_path"] = b"/sse"
+
+                            if scope["method"] == "DELETE":
+                                from starlette.responses import Response
+                                await Response(status_code=204)(scope, receive, send)
+                                return
+
+                            if scope["method"] == "POST":
+                                # Read body to extract request data
+                                body_chunks = []
+                                more_body = True
+                                while more_body:
+                                    msg = await receive()
+                                    body_chunks.append(msg.get("body", b""))
+                                    more_body = msg.get("more_body", False)
+                                full_body = b"".join(body_chunks)
+                                
+                                try:
+                                    req_data = json.loads(full_body)
+                                    req_id = req_data.get("id")
+                                    method = req_data.get("method")
+                                except:
+                                    req_data = {}
+                                    req_id = None
+                                    method = None
+
+                                async def replay_receive():
+                                    return {"type": "http.request", "body": full_body, "more_body": False}
+
+                                # Try to find an active SSE session to attach to
+                                session_id_found = False
+                                query = scope.get("query_string", b"").decode()
+                                if "session_id=" not in query:
+                                    try:
+                                        from starlette.routing import Mount
+                                        sse_instance = None
+                                        for route in app.routes:
+                                            if isinstance(route, Mount) and route.path == "/messages":
+                                                if hasattr(route.app, "__self__"):
+                                                    sse_instance = route.app.__self__
+                                                    break
+                                        if sse_instance and hasattr(sse_instance, "_read_stream_writers") and sse_instance._read_stream_writers:
+                                            last_session_id = list(sse_instance._read_stream_writers.keys())[-1]
+                                            new_query = f"session_id={last_session_id.hex}"
+                                            if query:
+                                                new_query = query + "&" + new_query
+                                            scope = dict(scope)
+                                            scope["query_string"] = new_query.encode()
+                                            session_id_found = True
+                                    except Exception:
+                                        pass
+                                else:
+                                    session_id_found = True
+
+                                if session_id_found:
+                                    # Standard SSE path: rewrite path to /messages/ and forward
+                                    scope = dict(scope)
+                                    scope["path"] = "/messages/"
+                                    scope["raw_path"] = b"/messages/"
+                                    
+                                    async def wrapped_send(msg):
+                                        if msg["type"] == "http.response.start":
+                                            headers = dict(msg.get("headers", []))
+                                            headers[b"content-type"] = b"application/json"
+                                            if b"content-length" in headers:
+                                                del headers[b"content-length"]
+                                            msg["headers"] = list(headers.items())
+                                        elif msg["type"] == "http.response.body":
+                                            if msg.get("body") in (b"Accepted", b"{}"):
+                                                res_obj = {"jsonrpc": "2.0", "id": req_id}
+                                                if method == "initialize":
+                                                    res_obj["result"] = {
+                                                        "protocolVersion": "2024-11-05",
+                                                        "capabilities": {
+                                                            "tools": {"listChanged": True},
+                                                            "resources": {"subscribe": True, "listChanged": True},
+                                                            "prompts": {"listChanged": True},
+                                                            "logging": {}
+                                                        },
+                                                        "serverInfo": {"name": "hermes", "version": "1.0.0"}
+                                                    }
+                                                elif method == "tools/list":
+                                                    tools = server._tool_manager.list_tools()
+                                                    res_tools = []
+                                                    for t in tools:
+                                                        schema = getattr(t, "parameters", {})
+                                                        if hasattr(schema, "model_json_schema"):
+                                                            schema = schema.model_json_schema()
+                                                        res_tools.append({
+                                                            "name": t.name,
+                                                            "description": t.description or "",
+                                                            "inputSchema": schema if isinstance(schema, dict) else {"type": "object"}
+                                                        })
+                                                    res_tools_list = res_tools
+                                                    res_obj["result"] = {"tools": res_tools_list}
+                                                else:
+                                                    res_obj["result"] = {}
+                                                msg["body"] = json.dumps(res_obj).encode("utf-8")
+                                        await send(msg)
+                                        
+                                    await app(scope, replay_receive, wrapped_send)
+                                    return
+                                else:
+                                    # STATELESS FALLBACK: Handle manually using FastMCP instance
+                                    res_obj = {"jsonrpc": "2.0", "id": req_id}
+                                    try:
+                                        if method == "initialize":
+                                            res_obj["result"] = {
+                                                "protocolVersion": "2024-11-05",
+                                                "capabilities": {
+                                                    "tools": {"listChanged": True},
+                                                    "resources": {"subscribe": True, "listChanged": True},
+                                                    "prompts": {"listChanged": True},
+                                                    "logging": {}
+                                                },
+                                                "serverInfo": {"name": "hermes", "version": "1.0.0"}
+                                            }
+                                        elif method == "tools/list":
+                                            tools = server._tool_manager.list_tools()
+                                            res_tools = []
+                                            for t in tools:
+                                                # In some SDK versions, parameters is a dict schema; in others, a Pydantic model
+                                                schema = getattr(t, "parameters", {})
+                                                if hasattr(schema, "model_json_schema"):
+                                                    schema = schema.model_json_schema()
+                                                
+                                                res_tools.append({
+                                                    "name": t.name,
+                                                    "description": t.description or "",
+                                                    "inputSchema": schema if isinstance(schema, dict) else {"type": "object"}
+                                                })
+                                            res_obj["result"] = {"tools": res_tools}
+                                        elif method == "tools/call":
+                                            tparams = req_data.get("params", {})
+                                            tname = tparams.get("name")
+                                            targs = tparams.get("arguments", {})
+                                            # Run tool call
+                                            result = await server.call_tool(tname, targs)
+                                            if isinstance(result, list):
+                                                # Standard MCP tools return list of content blocks
+                                                res_obj["result"] = {"content": [c.model_dump() if hasattr(c, "model_dump") else c for c in result]}
+                                            else:
+                                                res_obj["result"] = result
+                                        else:
+                                            res_obj["result"] = {}
+                                    except Exception as e:
+                                        res_obj["error"] = {"code": -32603, "message": str(e)}
+                                    
+                                    from starlette.responses import Response
+                                    await Response(json.dumps(res_obj), media_type="application/json")(scope, receive, send)
+                                    return
+                                
+                    await app(scope, receive, send)
+                
+                print(f"Starting Hermes MCP Server (SSE) on HTTP {server.settings.host}:{port}...")
+                import uvicorn
+                config = uvicorn.Config(
+                    asgi_rewrite,
+                    host=server.settings.host,
+                    port=server.settings.port,
+                    log_level=server.settings.log_level.lower(),
+                )
+                uvicorn_server = uvicorn.Server(config)
+                await uvicorn_server.serve()
+            else:
+                await server.run_stdio_async()
         finally:
             bridge.stop()
 

@@ -1,0 +1,60 @@
+diff --git a/hermes_cli/main.py b/hermes_cli/main.py
+index 2fb27dd2..f7d5af53 100644
+--- a/hermes_cli/main.py
++++ b/hermes_cli/main.py
+@@ -7105,6 +7105,12 @@ Examples:
+         action="store_true",
+         help="Enable verbose logging on stderr",
+     )
++    mcp_serve_p.add_argument(
++        "--port",
++        type=int,
++        default=None,
++        help="Run as an SSE HTTP server on the given port (e.g. 8642) instead of stdio",
++    )
+ 
+     mcp_add_p = mcp_sub.add_parser(
+         "add", help="Add an MCP server (discovery-first install)"
+diff --git a/hermes_cli/mcp_config.py b/hermes_cli/mcp_config.py
+index ae845b06..672bf418 100644
+--- a/hermes_cli/mcp_config.py
++++ b/hermes_cli/mcp_config.py
+@@ -743,7 +743,7 @@ def mcp_command(args):
+ 
+     if action == "serve":
+         from mcp_serve import run_mcp_server
+-        run_mcp_server(verbose=getattr(args, "verbose", False))
++        run_mcp_server(verbose=getattr(args, "verbose", False), port=getattr(args, "port", None))
+         return
+ 
+     handlers = {
+diff --git a/mcp_serve.py b/mcp_serve.py
+index e8294d1f..b7e7c763 100644
+--- a/mcp_serve.py
++++ b/mcp_serve.py
+@@ -833,8 +833,8 @@ def create_mcp_server(event_bridge: Optional[EventBridge] = None) -> "FastMCP":
+ # Entry point
+ # ---------------------------------------------------------------------------
+ 
+-def run_mcp_server(verbose: bool = False) -> None:
+-    """Start the Hermes MCP server on stdio."""
++def run_mcp_server(verbose: bool = False, port: Optional[int] = None) -> None:
++    """Start the Hermes MCP server on stdio or HTTP/SSE."""
+     if not _MCP_SERVER_AVAILABLE:
+         print(
+             "Error: MCP server requires the 'mcp' package.\n"
+@@ -857,7 +857,13 @@ def run_mcp_server(verbose: bool = False) -> None:
+ 
+     async def _run():
+         try:
+-            await server.run_stdio_async()
++            if port is not None:
++                server.settings.host = "0.0.0.0"
++                server.settings.port = port
++                print(f"Starting Hermes MCP Server (SSE) on HTTP port {port}...")
++                await server.run_sse_async()
++            else:
++                await server.run_stdio_async()
+         finally:
+             bridge.stop()
+ 
